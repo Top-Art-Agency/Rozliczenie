@@ -3,10 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#2f3f8f">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>Dzienny limit wydatków</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
+html, body, button, input, select, textarea, a, label { touch-action: manipulation; }
+input, select, textarea { font-size: 16px; }
 /* Layout: jedna wąska kolumna — przełącznik Prywatne / Karta służbowa, duża liczba, bilans, dodawanie, lista */
 :root {
   --bg: #f3f4f7;
@@ -91,6 +95,16 @@ input[type=number], input[type=text], input[type=date] {
 .list li.done .n, .list li.done .num { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--line); }
 h2 { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600; margin: 0 0 4px; }
 details summary { cursor: pointer; color: var(--muted); font-size: .88rem; padding: 4px 0; }
+.login { position: fixed; inset: 0; background: var(--bg); display: grid; place-items: center; padding: 16px; z-index: 10; }
+.login-box { max-width: 340px; display: grid; gap: 12px; text-align: center; }
+.login-box p { margin: 0; color: var(--muted); }
+.login-err { color: var(--neg) !important; font-size: .85rem; min-height: 1.2em; }
+.dlg-msg { margin: 0; color: var(--neg); font-size: .85rem; }
+.dlg-msg:empty { display: none; }
+.head-right { display: grid; justify-items: end; gap: 4px; }
+.sync { font-size: .72rem; color: var(--pos); }
+.sync::before { content: "● "; }
+.sync.bad { color: var(--neg); }
 .save-state { font-size: .78rem; color: var(--muted); min-height: 1.2em; }
 
 dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--paper); color: var(--ink); padding: 0; width: min(420px, calc(100vw - 32px)); }
@@ -106,6 +120,9 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
 .calc { background: var(--bg); border-radius: 8px; padding: 10px 12px; font-size: .85rem; }
 .actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
 </style>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 </head>
 <body>
 <div class="wrap">
@@ -118,7 +135,10 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
         <button class="arrow" id="next" aria-label="Następny okres">›</button>
       </div>
     </div>
-    <button class="ghost" id="openSettings">Ustawienia</button>
+    <div class="head-right">
+      <button class="ghost" id="openSettings">Ustawienia</button>
+      <span class="sync" id="syncState" role="status">Łączenie z kontem…</span>
+    </div>
   </header>
 
   <div class="tabs" role="tablist">
@@ -126,6 +146,7 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
     <button role="tab" id="tabBiz" aria-selected="false">Karta służbowa</button>
   </div>
 
+  <div class="banner" id="setupNote" hidden>Brak konfiguracji Firebase w pliku index.html. Dane zapisują się tylko w tej przeglądarce.</div>
   <div class="banner" id="exampleBanner" hidden></div>
 
   <section class="hero" aria-live="polite">
@@ -152,6 +173,15 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
     <div class="save-state" id="saveState"></div>
   </section>
 </div>
+
+<section class="login" id="login" hidden>
+  <div class="login-box">
+    <h1>Dzienny limit</h1>
+    <p>Zaloguj się, żeby mieć te same dane na telefonie i komputerze.</p>
+    <button class="primary" type="button" id="loginBtn">Zaloguj przez Google</button>
+    <p class="login-err" id="loginError" role="alert"></p>
+  </div>
+</section>
 
 <dialog id="settings">
   <form method="dialog" id="settingsForm">
@@ -185,7 +215,9 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
         <small>Wpisz kwotę, którą widzisz teraz w banku. Wydatki dodane od tej chwili będą od niej odejmowane.</small>
       </div>
     </div>
+    <p class="dlg-msg" id="dlgMsg" role="alert"></p>
     <div class="actions">
+      <button type="button" class="ghost" id="logout" hidden style="margin-right:auto">Wyloguj</button>
       <button type="button" class="ghost" id="cancelSettings">Anuluj</button>
       <button type="submit" class="primary">Zapisz</button>
     </div>
@@ -209,17 +241,95 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
   const today = new Date(); today.setHours(0, 0, 0, 0);
 
   // ---------- storage: private per-user db, browser fallback ----------
-  let db = null, uid = null;
+  let db = null, uid = null, mode = 'connecting'; // connecting | account | local
+  const docPath = name => 'users/' + uid + '/' + name;
+
+  // ---------- Firebase: wklej tutaj konfigurację swojego projektu ----------
+  const FIREBASE_CONFIG = {
+    apiKey: "AIzaSyA9G3Cvye04oBRg1_AtaMRvoWe7HaPnuMA",
+    authDomain: "rozliczenia-585d1.firebaseapp.com",
+    databaseURL: "https://rozliczenia-585d1-default-rtdb.europe-west1.firebasedatabase.app",
+    projectId: "rozliczenia-585d1",
+    appId: "1:300629557867:web:30bf9300e6299ecaf4672e"
+  };
+
+  function connectFirebase() {
+    if (!window.firebase || !FIREBASE_CONFIG.apiKey || !FIREBASE_CONFIG.databaseURL) { $('setupNote').hidden = false; return Promise.resolve(null); }
+    firebase.initializeApp(FIREBASE_CONFIG);
+    const auth = firebase.auth();
+    return new Promise(res => {
+      let done = false;
+      authResolve = u => { if (done || !u) return; done = true; $('login').hidden = true; res(u); };
+      auth.onAuthStateChanged(u => { if (u) authResolve(u); else if (!done) $('login').hidden = false; });
+      // Safari potrafi długo (albo wcale) nie zgłosić stanu logowania – wtedy i tak pokaż ekran logowania
+      setTimeout(() => { if (!done) $('login').hidden = false; }, 2500);
+    });
+  }
+  let authResolve = () => {};
+  $('loginBtn').onclick = () => {
+    $('loginError').textContent = '';
+    const p = new firebase.auth.GoogleAuthProvider();
+    p.setCustomParameters({ prompt: 'select_account' });
+    // wywołane od razu w kliknięciu, żeby Safari nie zablokował okna logowania
+    firebase.auth().signInWithPopup(p).then(r => authResolve(r.user)).catch(e => {
+      if (e.code === 'auth/popup-blocked') $('loginError').textContent = 'Przeglądarka zablokowała okno logowania. Zezwól na wyskakujące okna dla tej strony i spróbuj ponownie.';
+      else if (e.code !== 'auth/popup-closed-by-user' && e.code !== 'auth/cancelled-popup-request') $('loginError').textContent = 'Nie udało się zalogować (' + e.code + ').';
+    });
+  };
+  $('logout').onclick = () => firebase.auth().signOut().then(() => location.reload());
+  const clone = o => JSON.parse(JSON.stringify(o));
+  const local = name => { try { const r = localStorage.getItem('dzienny-limit:' + name); return r ? JSON.parse(r) : null; } catch (e) { return null; } };
   const store = {
     async get(name) {
-      if (db && uid) { const s = await db.doc('data/users/' + uid + '/' + name).get(); return s.exists ? JSON.parse(JSON.stringify(s.data())) : null; }
-      try { const raw = localStorage.getItem('dzienny-limit:' + name); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+      if (mode === 'account') { const s = await db.ref(docPath(name)).get(); return s.exists() ? clone(s.val()) : null; }
+      return local(name);
     },
     async set(name, data) {
-      if (db && uid) return db.doc('data/users/' + uid + '/' + name).set(data);
-      try { localStorage.setItem('dzienny-limit:' + name, JSON.stringify(data)); } catch (e) {}
+      if (mode === 'account') return db.ref(docPath(name)).set(data);
+      if (mode === 'connecting') throw { code: 'jeszcze nie połączono' };
+      localStorage.setItem('dzienny-limit:' + name, JSON.stringify(data));
     }
   };
+  const inflight = {};
+  function setStatus(text, bad) { const el = $('syncState'); el.textContent = text; el.classList.toggle('bad', !!bad); }
+  function errText(e) {
+    const c = String((e && (e.code || e.message)) || 'błąd');
+    if (/permission/i.test(c)) return 'brak dostępu do bazy – sprawdź reguły w Realtime Database';
+    return c;
+  }
+  function notReady() {
+    if (mode !== 'connecting') return false;
+    const msg = 'Strona jeszcze nie połączyła się z bazą. Poczekaj chwilę albo odśwież stronę.';
+    $('saveState').textContent = msg; $('dlgMsg').textContent = msg;
+    return true;
+  }
+  function watchDoc(name, apply) {
+    const ref = db.ref(docPath(name));
+    const cb = s => { if (inflight[name]) return; apply(s.exists() ? clone(s.val()) : null); };
+    ref.on('value', cb, e => setStatus('Błąd: ' + errText(e), true));
+    return () => ref.off('value', cb);
+  }
+  let unsubPeriod = null;
+  function watchPeriod() {
+    if (mode !== 'account') return;
+    if (unsubPeriod) unsubPeriod();
+    const id = periodId(periodStart);
+    unsubPeriod = watchDoc(id, data => {
+      if (!data || periodId(periodStart) !== id) return;
+      if (!data.days) data.days = {};
+      cache[id] = clone(data); period = data; render();
+    });
+  }
+  function applySettings(data) {
+    if (!data) return;
+    const restart = privExample || !settings || data.startDay !== settings.startDay;
+    settings = data; privExample = false;
+    if (restart) { periodStart = periodFor(today, settings.startDay); loadPeriod(); } else render();
+  }
+  function applyBiz(data) {
+    if (!data) return;
+    biz = { balance: 0, balanceAt: 0, items: [], ...data }; bizExample = false; render();
+  }
 
   // ---------- state ----------
   let settings = null, periodStart = null, period = null;
@@ -242,6 +352,7 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
   async function loadPeriod() {
     const id = periodId(periodStart);
     if (!privExample && !(id in cache)) { try { cache[id] = await store.get(id); } catch (e) { cache[id] = null; } }
+    if (!privExample && mode === 'account' && !cache[id] && local(id)) { cache[id] = local(id); queueSave(id, cache[id]); }
     const stored = privExample ? null : cache[id];
     period = stored || { income: settings.income, savings: settings.savings, fixed: settings.fixed, days: {} };
     if (!period.days) period.days = {};
@@ -252,6 +363,7 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
         if (spends[i].length) period.days[key(d)] = spends[i].map(([a, n]) => ({ a, n }));
     }
     resetDate();
+    watchPeriod();
     render();
   }
 
@@ -303,6 +415,7 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
   function emptyLi(text) { const li = document.createElement('li'); li.className = 'empty'; li.textContent = text; return li; }
 
   function render() {
+    if (!period || !settings || !biz) return;
     const end = periodEnd(periodStart);
     $('periodLabel').textContent = short(periodStart) + ' – ' + short(end) + ' ' + end.getFullYear();
     $('periodBar').style.visibility = tab === 'priv' ? 'visible' : 'hidden';
@@ -381,9 +494,11 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
   let saveChain = Promise.resolve();
   function queueSave(name, data) {
     $('saveState').textContent = 'Zapisuję…';
+    inflight[name] = (inflight[name] || 0) + 1;
     saveChain = saveChain.then(() => store.set(name, data)).then(
-      () => { $('saveState').textContent = 'Zapisano'; },
-      () => { $('saveState').textContent = 'Nie udało się zapisać. Spróbuj jeszcze raz za chwilę.'; });
+      () => { $('saveState').textContent = mode === 'account' ? 'Zapisano na koncie' : 'Zapisano w tej przeglądarce'; },
+      e => { $('saveState').textContent = 'Nie udało się zapisać: ' + errText(e) + '.'; setStatus('Błąd zapisu: ' + errText(e), true); })
+      .then(() => { inflight[name]--; });
   }
   function persist() {
     if (privExample) return;
@@ -396,6 +511,7 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
     ev.preventDefault();
     const a = r2(parseFloat(String($('amount').value).replace(',', '.')));
     if (!isFinite(a) || a === 0) return;
+    if (notReady()) return;
     if (tab === 'priv' ? privExample : bizExample) { openSettings(); return; }
     let d = $('date').value || key(today);
     const n = $('note').value.trim();
@@ -431,6 +547,7 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
     $('calcPreview').textContent = 'Do wydania ' + fmt(pool) + ' przez ' + n + ' dni = ' + fmt(pool / n) + ' dziennie';
   }
   function openSettings() {
+    $('dlgMsg').textContent = '';
     const priv = tab === 'priv';
     $('privFields').hidden = !priv; $('bizFields').hidden = priv;
     ['sIncome', 'sSavings', 'sStart'].forEach(id => { $(id).required = priv; });
@@ -456,6 +573,7 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
   $('cancelSettings').onclick = () => dlg.close();
   $('settingsForm').addEventListener('submit', async ev => {
     ev.preventDefault();
+    if (notReady()) return;
     dlg.close();
     if (tab === 'biz') {
       const balance = r2(parseFloat(String($('sBalance').value).replace(',', '.')) || 0);
@@ -469,7 +587,7 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
     const reload = privExample || startDay !== settings.startDay;
     settings = { income, savings, fixed, startDay, carrySurplus: $('sSurplus').checked };
     privExample = false;
-    try { await store.set('settings', settings); } catch (e) { $('saveState').textContent = 'Nie udało się zapisać ustawień.'; }
+    queueSave('settings', clone(settings));
     if (reload) { periodStart = periodFor(today, startDay); await loadPeriod(); }
     Object.assign(period, { income, savings, fixed });
     persist(); render();
@@ -485,14 +603,23 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
     periodStart = periodFor(today, settings.startDay);
     setTab(tab);
     await loadPeriod();
-    try {
-      if (window.claude && window.claude.use) {
-        const [d, u] = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
-        if (d && u) { const id = await u.id(); if (id) { db = d; uid = id; } }
-      }
-    } catch (e) {}
+    setStatus('Łączenie…');
+    let user = null, fbErr = null;
+    try { user = await connectFirebase(); if (user) { db = firebase.database(); uid = user.uid; } }
+    catch (e) { fbErr = e; db = null; }
+    mode = db ? 'account' : 'local';
+    setStatus(db ? 'Zapis w chmurze' : fbErr ? 'Błąd Firebase: ' + errText(fbErr) + ' (zapis tylko w przeglądarce)' : 'Zapis tylko w tej przeglądarce', !db);
+    $('logout').hidden = !db;
+    $('saveState').textContent = '';
     let saved = null, savedBiz = null;
-    try { [saved, savedBiz] = await Promise.all([store.get('settings'), store.get('biz')]); } catch (e) {}
+    try { [saved, savedBiz] = await Promise.all([store.get('settings'), store.get('biz')]); }
+    catch (e) { setStatus('Błąd: ' + errText(e), true); }
+    if (mode === 'account') {
+      // dane wpisane wcześniej, gdy strona zapisała je tylko w przeglądarce
+      const ls = local('settings'), lb = local('biz');
+      if (!saved && ls) { saved = ls; queueSave('settings', ls); }
+      if (!savedBiz && lb) { savedBiz = lb; queueSave('biz', lb); }
+    }
     if (savedBiz) { biz = { balance: 0, balanceAt: 0, items: [], ...savedBiz }; bizExample = false; }
     if (saved) {
       settings = saved; privExample = false;
@@ -504,6 +631,7 @@ dialog h3 { font-family: var(--f-display); margin: 0; font-size: 1.1rem; }
         bizExample = false; persistBiz();
       }
     }
+    if (mode === 'account') { watchDoc('settings', applySettings); watchDoc('biz', applyBiz); watchPeriod(); }
     render();
   }
   boot();
